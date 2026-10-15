@@ -13,6 +13,8 @@ CutStock comes in two flavors that share the same optimization core:
 
 > **[Deutsche Version](README.de.md)**
 
+> **Repository notice (2026-10-15):** This repository was recreated to clean up the git history. Previous issues and stars were lost in the process. If you had an open issue, please re-open it -- we apologize for the inconvenience.
+
 ## Features
 
 - **1D + 2D Optimization** -- bars (1D bin-packing) and panels (2D guillotine packing) with saw blade kerf

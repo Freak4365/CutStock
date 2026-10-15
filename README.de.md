@@ -13,6 +13,8 @@ CutStock gibt es in zwei Varianten, die denselben Optimierungskern teilen:
 
 > **[English version](README.md)**
 
+> **Hinweis zum Repository (15.10.2026):** Dieses Repository wurde neu angelegt, um die Git-Historie zu bereinigen. Dabei sind fruehere Issues und Stars verloren gegangen. Falls Sie ein offenes Issue hatten, erstellen Sie es bitte erneut -- wir bitten um Entschuldigung.
+
 ## Funktionen
 
 - **1D + 2D Optimierung** -- Stangen (1D Bin-Packing) und Platten (2D Guillotine-Packing) mit Saegeblatt-Schnittbreite (Kerf)

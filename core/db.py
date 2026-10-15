@@ -11,6 +11,8 @@ import sqlite3
 from pathlib import Path
 
 from core.models import (
+    Defekt,
+    Einzelstueck,
     Lagerstueck,
     Maserung,
     Material,
@@ -107,6 +109,23 @@ CREATE TABLE IF NOT EXISTS projekt (
     name TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS einzelstueck (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    lagerstueck_id  INTEGER NOT NULL REFERENCES lagerstueck(id) ON DELETE CASCADE,
+    nr              INTEGER NOT NULL,
+    notiz           TEXT    NOT NULL DEFAULT '',
+    UNIQUE(lagerstueck_id, nr)
+);
+
+CREATE TABLE IF NOT EXISTS defekt (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    einzelstueck_id INTEGER NOT NULL REFERENCES einzelstueck(id) ON DELETE CASCADE,
+    position        REAL    NOT NULL DEFAULT 0,
+    position_y      REAL    NOT NULL DEFAULT 0,
+    laenge          REAL    NOT NULL,
+    breite          REAL    NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS teil (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     projekt_id  INTEGER NOT NULL REFERENCES projekt(id),
@@ -151,7 +170,6 @@ class Database:
         if "maserung" not in mat_cols:
             self.conn.execute(
                 "ALTER TABLE material ADD COLUMN maserung TEXT NOT NULL DEFAULT 'keine'")
-            # Bestehende Materialien migrieren: drehung_erlaubt=False → maserung=längs
             self.conn.execute(
                 "UPDATE material SET maserung='längs' WHERE drehung_erlaubt=0")
         teil_cols = {row[1] for row in
@@ -162,9 +180,58 @@ class Database:
         if "gesaegt_anzahl" not in teil_cols:
             self.conn.execute(
                 "ALTER TABLE teil ADD COLUMN gesaegt_anzahl INTEGER NOT NULL DEFAULT 0")
-            # Bestehende gesägte Teile migrieren
             self.conn.execute(
                 "UPDATE teil SET gesaegt_anzahl = stueckzahl WHERE status = 'gesägt'")
+        self._migrate_einzelstuecke()
+
+    def _migrate_einzelstuecke(self):
+        """Einzelstück-Tabelle befüllen, Defekt-FK migrieren."""
+        defekt_cols = {row[1] for row in
+                       self.conn.execute("PRAGMA table_info(defekt)").fetchall()}
+        if "lagerstueck_id" not in defekt_cols:
+            self._ensure_einzelstuecke_exist()
+            return
+        # Alte defekt-Tabelle hat lagerstueck_id → migrieren
+        self._ensure_einzelstuecke_exist()
+        old_defekte = self.conn.execute("SELECT * FROM defekt").fetchall()
+        self.conn.execute("DROP TABLE defekt")
+        self.conn.execute("""
+            CREATE TABLE defekt (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                einzelstueck_id INTEGER NOT NULL REFERENCES einzelstueck(id)
+                                ON DELETE CASCADE,
+                position        REAL NOT NULL DEFAULT 0,
+                position_y      REAL NOT NULL DEFAULT 0,
+                laenge          REAL NOT NULL,
+                breite          REAL NOT NULL DEFAULT 0
+            )""")
+        for od in old_defekte:
+            es = self.conn.execute(
+                "SELECT id FROM einzelstueck WHERE lagerstueck_id=? AND nr=1",
+                (od["lagerstueck_id"],),
+            ).fetchone()
+            if es:
+                self.conn.execute(
+                    """INSERT INTO defekt (einzelstueck_id, position,
+                       position_y, laenge, breite) VALUES (?,?,?,?,?)""",
+                    (es["id"], od["position"], od["position_y"],
+                     od["laenge"], od["breite"]),
+                )
+
+    def _ensure_einzelstuecke_exist(self):
+        """Für alle Lagerstücke ohne Einzelstücke welche anlegen."""
+        rows = self.conn.execute(
+            """SELECT l.id, l.stueckzahl FROM lagerstueck l
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM einzelstueck e WHERE e.lagerstueck_id = l.id
+               )"""
+        ).fetchall()
+        for r in rows:
+            for nr in range(1, r["stueckzahl"] + 1):
+                self.conn.execute(
+                    "INSERT INTO einzelstueck (lagerstueck_id, nr) VALUES (?,?)",
+                    (r["id"], nr),
+                )
 
     def close(self):
         self.conn.commit()
@@ -252,6 +319,7 @@ class Database:
                    stueckzahl=? WHERE id=?""",
                 (l.material_id, l.laenge, l.breite, l.stueckzahl, l.id),
             )
+        self._sync_einzelstuecke(l.id, l.stueckzahl)
         self.conn.commit()
         return l
 
@@ -283,6 +351,142 @@ class Database:
             id=row["id"], material_id=row["material_id"],
             laenge=row["laenge"], breite=row["breite"],
             stueckzahl=row["stueckzahl"],
+        )
+
+    # ------------------------------------------------------------------
+    # Einzelstück
+    # ------------------------------------------------------------------
+
+    def _sync_einzelstuecke(self, lagerstueck_id: int, stueckzahl: int):
+        """Einzelstücke an Stückzahl anpassen (anlegen/löschen)."""
+        existing = self.conn.execute(
+            "SELECT nr FROM einzelstueck WHERE lagerstueck_id=? ORDER BY nr",
+            (lagerstueck_id,),
+        ).fetchall()
+        existing_nrs = {r["nr"] for r in existing}
+        for nr in range(1, stueckzahl + 1):
+            if nr not in existing_nrs:
+                self.conn.execute(
+                    "INSERT INTO einzelstueck (lagerstueck_id, nr) VALUES (?,?)",
+                    (lagerstueck_id, nr),
+                )
+        for nr in existing_nrs:
+            if nr > stueckzahl:
+                self.conn.execute(
+                    """DELETE FROM einzelstueck
+                       WHERE lagerstueck_id=? AND nr=?""",
+                    (lagerstueck_id, nr),
+                )
+
+    def list_einzelstuecke(self, lagerstueck_id: int) -> list[Einzelstueck]:
+        rows = self.conn.execute(
+            "SELECT * FROM einzelstueck WHERE lagerstueck_id=? ORDER BY nr",
+            (lagerstueck_id,),
+        ).fetchall()
+        return [Einzelstueck(id=r["id"], lagerstueck_id=r["lagerstueck_id"],
+                             nr=r["nr"], notiz=r["notiz"]) for r in rows]
+
+    def get_einzelstueck(self, eid: int) -> Einzelstueck | None:
+        row = self.conn.execute(
+            "SELECT * FROM einzelstueck WHERE id=?", (eid,)
+        ).fetchone()
+        if not row:
+            return None
+        return Einzelstueck(id=row["id"], lagerstueck_id=row["lagerstueck_id"],
+                            nr=row["nr"], notiz=row["notiz"])
+
+    def save_einzelstueck(self, e: Einzelstueck) -> Einzelstueck:
+        self.conn.execute(
+            "UPDATE einzelstueck SET notiz=? WHERE id=?",
+            (e.notiz, e.id),
+        )
+        self.conn.commit()
+        return e
+
+    # ------------------------------------------------------------------
+    # Defekt
+    # ------------------------------------------------------------------
+
+    def save_defekt(self, d: Defekt) -> Defekt:
+        if d.id is None:
+            cur = self.conn.execute(
+                """INSERT INTO defekt (einzelstueck_id, position, position_y,
+                   laenge, breite) VALUES (?,?,?,?,?)""",
+                (d.einzelstueck_id, d.position, d.position_y,
+                 d.laenge, d.breite),
+            )
+            d.id = cur.lastrowid
+        else:
+            self.conn.execute(
+                """UPDATE defekt SET einzelstueck_id=?, position=?,
+                   position_y=?, laenge=?, breite=? WHERE id=?""",
+                (d.einzelstueck_id, d.position, d.position_y,
+                 d.laenge, d.breite, d.id),
+            )
+        self.conn.commit()
+        return d
+
+    def list_defekte(self, einzelstueck_id: int) -> list[Defekt]:
+        rows = self.conn.execute(
+            "SELECT * FROM defekt WHERE einzelstueck_id=? ORDER BY position",
+            (einzelstueck_id,),
+        ).fetchall()
+        return [self._row_to_defekt(r) for r in rows]
+
+    def list_defekte_for_lagerstueck(self, lagerstueck_id: int
+                                     ) -> dict[int, list[Defekt]]:
+        """Defekte gruppiert nach Stücknummer für ein Lagerstück."""
+        rows = self.conn.execute(
+            """SELECT d.*, e.nr FROM defekt d
+               JOIN einzelstueck e ON d.einzelstueck_id = e.id
+               WHERE e.lagerstueck_id = ?
+               ORDER BY e.nr, d.position""",
+            (lagerstueck_id,),
+        ).fetchall()
+        result: dict[int, list[Defekt]] = {}
+        for r in rows:
+            result.setdefault(r["nr"], []).append(self._row_to_defekt(r))
+        return result
+
+    def list_defekte_for_material(
+        self, material_id: int,
+    ) -> dict[int, dict[int, list[Defekt]]]:
+        """Defekte für den Optimizer: {lagerstueck_id: {stueck_nr: [Defekt]}}."""
+        rows = self.conn.execute(
+            """SELECT d.*, e.nr, e.lagerstueck_id FROM defekt d
+               JOIN einzelstueck e ON d.einzelstueck_id = e.id
+               JOIN lagerstueck l ON e.lagerstueck_id = l.id
+               WHERE l.material_id = ?
+               ORDER BY e.lagerstueck_id, e.nr, d.position""",
+            (material_id,),
+        ).fetchall()
+        result: dict[int, dict[int, list[Defekt]]] = {}
+        for r in rows:
+            lid = r["lagerstueck_id"]
+            nr = r["nr"]
+            result.setdefault(lid, {}).setdefault(nr, []).append(
+                self._row_to_defekt(r))
+        return result
+
+    def get_defekt(self, did: int) -> Defekt | None:
+        row = self.conn.execute(
+            "SELECT * FROM defekt WHERE id=?", (did,)
+        ).fetchone()
+        return self._row_to_defekt(row) if row else None
+
+    def delete_defekt(self, did: int):
+        self.conn.execute("DELETE FROM defekt WHERE id=?", (did,))
+        self.conn.commit()
+
+    @staticmethod
+    def _row_to_defekt(row: sqlite3.Row) -> Defekt:
+        return Defekt(
+            id=row["id"],
+            einzelstueck_id=row["einzelstueck_id"],
+            position=row["position"],
+            position_y=row["position_y"],
+            laenge=row["laenge"],
+            breite=row["breite"],
         )
 
     # ------------------------------------------------------------------

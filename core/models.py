@@ -102,6 +102,24 @@ class Teil:
         return self.gesaegt_anzahl >= self.stueckzahl
 
 
+@dataclass
+class Einzelstueck:
+    id: int | None = None
+    lagerstueck_id: int = 0
+    nr: int = 1
+    notiz: str = ""
+
+
+@dataclass
+class Defekt:
+    id: int | None = None
+    einzelstueck_id: int = 0
+    position: float = 0.0
+    position_y: float = 0.0
+    laenge: float = 0.0
+    breite: float = 0.0
+
+
 def drehung_fuer_teil(mat_maserung: Maserung, teil_maserung: Maserung
                       ) -> tuple[bool, bool]:
     """Berechnet welche Orientierungen für ein Teil erlaubt sind.

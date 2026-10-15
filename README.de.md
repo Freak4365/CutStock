@@ -19,6 +19,8 @@ CutStock gibt es in zwei Varianten, die denselben Optimierungskern teilen:
 - **Drei Algorithmen** -- Schnell (Greedy), Nested Guillotine (intelligente Schnittrichtung), Gruendlich (Genetischer Algorithmus, ~95% Ausnutzung)
 - **Maserungsrichtung** -- beruecksichtigt Holzmaserung pro Material und Teil (laengs, quer oder egal)
 - **Besaeumung** -- konfigurierbarer Rand fuer beschaedigte Plattenkanten
+- **Defekte markieren** -- Defektstellen (Astloecher, Risse, Verfaerbungen) pro Einzelstueck erfassen; der Optimierer umgeht sie automatisch
+- **Einzelstueck-Nummerierung** -- bei mehreren gleichen Brettern gezielt angeben, welches Brett welchen Defekt hat; aufklappbare Stueckliste im Lagerbestand
 - **Lagerverwaltung** -- Bestand verfolgen, verbrauchte Stuecke automatisch austragen, verwertbare Reste automatisch einbuchen
 - **Projektverwaltung** -- Teile nach Projekten organisieren, Import/Export als JSON, Teilelisten-Import aus CSV
 - **Visuelle Schnittplaene** -- farbkodierte Zuschnittschemata mit Labels und Massen
@@ -99,7 +101,7 @@ anklicken, neue Taste druecken).
 
 ### Material & Lager
 
-Materialien (Platten, Stangen) mit Dicke, Querschnitt, Maserungsrichtung, Besaeumung und Rest-Schwellen verwalten. Der Lagerbestand zeigt die Stuecke des gewaehlten Materials.
+Materialien (Platten, Stangen) mit Dicke, Querschnitt, Maserungsrichtung, Besaeumung und Rest-Schwellen verwalten. Der Lagerbestand zeigt die Stuecke des gewaehlten Materials -- bei mehreren gleichen Brettern aufklappbar mit Einzelstueck-Nummerierung und Defekt-Badges.
 
 ![Material & Lager](docs/screenshot_material.png)
 

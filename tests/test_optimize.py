@@ -2,6 +2,7 @@
 
 import pytest
 
+from core.models import Defekt
 from core.optimize import (
     OptimierungsErgebnis,
     PlattenVorrat,
@@ -113,6 +114,31 @@ class TestOptimize1D:
         )
         assert erg.gesamt_verschnitt_prozent == pytest.approx(50.0)
 
+    def test_defekt_teilt_stange(self):
+        """Ein Defekt in der Mitte teilt die Stange in zwei Segmente."""
+        defekte = {1: {1: [Defekt(einzelstueck_id=1,
+                                   position=1000, laenge=100)]}}
+        erg = optimize_1d(
+            teile=[("A", 900.0, 1), ("B", 1300.0, 1)],
+            vorrat=[StangenVorrat(1, 2500.0, 1)],
+            kerf=3.0,
+            defekte=defekte,
+        )
+        assert len(erg.fehlende_teile) == 0
+        assert len(erg.schnittplaene) == 1
+
+    def test_defekt_macht_teil_unmoeglich(self):
+        """Defekt macht Stange zu kurz für ein langes Teil."""
+        defekte = {1: {1: [Defekt(einzelstueck_id=1,
+                                   position=500, laenge=100)]}}
+        erg = optimize_1d(
+            teile=[("A", 2000.0, 1)],
+            vorrat=[StangenVorrat(1, 2500.0, 1)],
+            kerf=3.0,
+            defekte=defekte,
+        )
+        assert erg.fehlende_teile == ["A"]
+
 
 # =====================================================================
 # 2D – Platten
@@ -201,6 +227,36 @@ class TestOptimize2D:
             drehung_erlaubt=False,
         )
         assert erg.gesamt_verschnitt_prozent == pytest.approx(75.0)
+
+    def test_defekt_blockiert_platte(self):
+        """Defekt blockiert Fläche — Teil wird daneben platziert."""
+        defekte = {1: {1: [Defekt(einzelstueck_id=1,
+                                   position=0, position_y=0,
+                                   laenge=400, breite=500)]}}
+        erg = optimize_2d(
+            teile=[("A", 500.0, 400.0, 1)],
+            vorrat=[PlattenVorrat(1, 1000.0, 500.0, 1)],
+            kerf=3.0,
+            drehung_erlaubt=False,
+            defekte=defekte,
+        )
+        assert len(erg.fehlende_teile) == 0
+        p = erg.schnittplaene[0].platzierungen[0]
+        assert p.x >= 403
+
+    def test_defekt_zu_gross_kein_platz(self):
+        """Defekt lässt nicht genug Platz — Teil passt nicht."""
+        defekte = {1: {1: [Defekt(einzelstueck_id=1,
+                                   position=0, position_y=0,
+                                   laenge=600, breite=500)]}}
+        erg = optimize_2d(
+            teile=[("A", 500.0, 400.0, 1)],
+            vorrat=[PlattenVorrat(1, 1000.0, 500.0, 1)],
+            kerf=3.0,
+            drehung_erlaubt=False,
+            defekte=defekte,
+        )
+        assert len(erg.fehlende_teile) == 1
 
     def test_guillotine_reste_sind_rechtecke(self):
         """Alle Reste müssen Rechtecke sein (Guillotine-Constraint)."""

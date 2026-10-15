@@ -19,6 +19,8 @@ CutStock comes in two flavors that share the same optimization core:
 - **Three Algorithms** -- Fast (Greedy), Nested Guillotine (smart split direction), Thorough (Genetic Algorithm, ~95% utilization)
 - **Grain Direction** -- respects wood grain per material and part (lengthwise, crosswise, or any)
 - **Edge Trimming** -- configurable trim margin for damaged board edges
+- **Defect Marking** -- mark defects (knots, cracks, discolorations) per individual piece; the optimizer routes cuts around them automatically
+- **Individual Piece Numbering** -- when you have multiple identical boards, specify exactly which board has which defect; expandable piece list in the stock view
 - **Stock Management** -- track inventory, auto-deduct used pieces, auto-add usable remnants
 - **Project Management** -- organize parts by project, import/export as JSON, import part lists from CSV
 - **Visual Cut Plans** -- color-coded cutting diagrams with labels and dimensions
@@ -98,7 +100,7 @@ Settings page and can be remapped there (click a key, press the new one).
 
 ### Material & Stock
 
-Manage materials (panels, bars) with thickness, cross-section, grain direction, edge trim, and minimum remnant thresholds. Stock pieces are shown for the selected material.
+Manage materials (panels, bars) with thickness, cross-section, grain direction, edge trim, and minimum remnant thresholds. Stock pieces are shown for the selected material -- for multiple identical boards, expand the row to see individual pieces with defect badges.
 
 ![Material & Stock](docs/screenshot_material.png)
 

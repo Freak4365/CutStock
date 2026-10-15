@@ -158,6 +158,15 @@ const Api = {
     updateStock: (id, data) => fetchJSON(`/api/stock/${id}`, 'PUT', data),
     deleteStock: (id) => fetchJSON(`/api/stock/${id}`, 'DELETE'),
 
+    getPieces: (stockId) => fetchJSON(`/api/stock/${stockId}/pieces`),
+    updatePiece: (id, data) => fetchJSON(`/api/pieces/${id}`, 'PUT', data),
+
+    getDefects: (stockId) => fetchJSON(`/api/stock/${stockId}/defects`),
+    getDefectsForPiece: (pieceId) => fetchJSON(`/api/pieces/${pieceId}/defects`),
+    createDefect: (pieceId, data) => fetchJSON(`/api/pieces/${pieceId}/defects`, 'POST', data),
+    updateDefect: (id, data) => fetchJSON(`/api/defects/${id}`, 'PUT', data),
+    deleteDefect: (id) => fetchJSON(`/api/defects/${id}`, 'DELETE'),
+
     getBlades: () => fetchJSON('/api/blades'),
     createBlade: (data) => fetchJSON('/api/blades', 'POST', data),
     updateBlade: (id, data) => fetchJSON(`/api/blades/${id}`, 'PUT', data),
@@ -389,14 +398,61 @@ async function renderStock() {
         return;
     }
 
+    const piecesMap = {};
+    const defectCounts = {};
+    await Promise.all(State.stock.map(async s => {
+        try {
+            const pieces = await Api.getPieces(s.id);
+            piecesMap[s.id] = pieces;
+            defectCounts[s.id] = pieces.reduce((sum, p) => sum + (p.defekt_count || 0), 0);
+        } catch {
+            piecesMap[s.id] = [];
+            defectCounts[s.id] = 0;
+        }
+    }));
+
     tbody.innerHTML = State.stock.map(s => {
         const selected = s.id === State.selectedStockId ? ' selected' : '';
+        const badge = defectCounts[s.id] > 0
+            ? ` <span class="defect-badge" title="${t('defect.title')}">${defectCounts[s.id]}</span>`
+            : '';
+        const expandable = s.stueckzahl > 1;
         return `<tr class="fd-table__row ${selected}" data-id="${s.id}">
-            <td class="fd-table__cell num">${formatDim(s.laenge)}</td>
+            <td class="fd-table__cell num">${formatDim(s.laenge)}${badge}</td>
             <td class="fd-table__cell num" style="${isPlatte ? '' : 'display:none'}">${formatDim(s.breite)}</td>
-            <td class="fd-table__cell num">${s.stueckzahl}</td>
+            <td class="fd-table__cell num${expandable ? ' expand-toggle' : ''}" data-stock-id="${s.id}">${expandable ? '<span class="expand-arrow">&#9654;</span> ' : ''}${s.stueckzahl}</td>
         </tr>`;
     }).join('');
+
+    tbody.querySelectorAll('td.expand-toggle').forEach(cell => {
+        cell.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const stockId = parseInt(cell.dataset.stockId);
+            const parentRow = cell.closest('tr');
+            const arrow = cell.querySelector('.expand-arrow');
+            const existing = tbody.querySelectorAll(`tr.piece-row[data-parent="${stockId}"]`);
+            if (existing.length > 0) {
+                existing.forEach(r => r.remove());
+                if (arrow) arrow.innerHTML = '&#9654;';
+                cell.classList.remove('expanded');
+                return;
+            }
+            if (arrow) arrow.innerHTML = '&#9660;';
+            cell.classList.add('expanded');
+            const pieces = piecesMap[stockId] || [];
+            const pieceRows = pieces.map(p => {
+                const pBadge = p.defekt_count > 0
+                    ? ` <span class="defect-badge">${p.defekt_count}</span>` : '';
+                const note = p.notiz ? ` <span class="piece-note">${escHtml(p.notiz)}</span>` : '';
+                return `<tr class="fd-table__row piece-row" data-parent="${stockId}" data-piece-id="${p.id}">
+                    <td class="fd-table__cell num piece-cell" colspan="${isPlatte ? 3 : 2}">
+                        &nbsp;&nbsp;&nbsp;&nbsp;#${p.nr}${note}${pBadge}
+                    </td>
+                </tr>`;
+            }).join('');
+            parentRow.insertAdjacentHTML('afterend', pieceRows);
+        });
+    });
 
     tbody.querySelectorAll('tr[data-id]').forEach(row => {
         row.addEventListener('click', () => selectStockRow(parseInt(row.dataset.id)));
@@ -725,7 +781,7 @@ function renderOptResults() {
             return `<div class="cut-plan-card">
                 <div class="plan-header">
                     <strong>${t('opt.preview')} ${i + 1}</strong>
-                    <span>${formatDim(plan.lager_laenge)}${plan.lager_breite ? ' x ' + formatDim(plan.lager_breite) : ''}</span>
+                    <span>${formatDim(plan.lager_laenge)}${plan.lager_breite ? ' x ' + formatDim(plan.lager_breite) : ''}${plan.stueck_nr ? ' (#' + plan.stueck_nr + ')' : ''}</span>
                     <span>${plan.platzierungen.length} ${t('proj.parts')}</span>
                     <span>${t('stat.utilization')}: ${(100 - plan.verschnitt_prozent).toFixed(1)}%</span>
                     <span class="waste">${t('stat.total_waste')}: ${plan.verschnitt_prozent.toFixed(1)}%</span>
@@ -1483,6 +1539,34 @@ function draw2D(ctx, canvasW, canvasH, plan, colorMap, hits) {
     ctx.lineWidth = 1;
     ctx.strokeRect(offsetX, offsetY, stockW, stockH);
 
+    // Defects (red hatched areas)
+    if (plan.defekte?.length) {
+        plan.defekte.forEach(d => {
+            const dx = offsetX + d.position * scale;
+            const dy = offsetY + d.position_y * scale;
+            const dw = d.laenge * scale;
+            const dh = d.breite * scale;
+            ctx.save();
+            ctx.fillStyle = 'rgba(200, 30, 30, 0.15)';
+            ctx.fillRect(dx, dy, dw, dh);
+            ctx.strokeStyle = 'rgba(200, 30, 30, 0.6)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(dx, dy, dw, dh);
+            ctx.beginPath();
+            ctx.rect(dx, dy, dw, dh);
+            ctx.clip();
+            ctx.strokeStyle = 'rgba(200, 30, 30, 0.35)';
+            ctx.lineWidth = 1;
+            const step = 8;
+            for (let i = -dh; i < dw + dh; i += step) {
+                ctx.moveTo(dx + i, dy);
+                ctx.lineTo(dx + i + dh, dy + dh);
+            }
+            ctx.stroke();
+            ctx.restore();
+        });
+    }
+
     // Parts
     plan.platzierungen.forEach(p => {
         // laenge/breite are already the actual x/y extents (rotation is
@@ -1607,6 +1691,32 @@ function draw1D(ctx, canvasW, canvasH, plan, colorMap, hits) {
     ctx.lineWidth = 1;
     ctx.strokeRect(padding.left, barY, drawW, barH);
 
+    // Defects (red hatched areas)
+    if (plan.defekte?.length) {
+        plan.defekte.forEach(d => {
+            const dx = padding.left + d.position * scale;
+            const dw = d.laenge * scale;
+            ctx.save();
+            ctx.fillStyle = 'rgba(200, 30, 30, 0.15)';
+            ctx.fillRect(dx, barY, dw, barH);
+            ctx.strokeStyle = 'rgba(200, 30, 30, 0.6)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(dx, barY, dw, barH);
+            ctx.beginPath();
+            ctx.rect(dx, barY, dw, barH);
+            ctx.clip();
+            ctx.strokeStyle = 'rgba(200, 30, 30, 0.35)';
+            ctx.lineWidth = 1;
+            const step = 8;
+            for (let i = -barH; i < dw + barH; i += step) {
+                ctx.moveTo(dx + i, barY);
+                ctx.lineTo(dx + i + barH, barY + barH);
+            }
+            ctx.stroke();
+            ctx.restore();
+        });
+    }
+
     // Parts
     plan.platzierungen.forEach(p => {
         const px = padding.left + p.x * scale;
@@ -1682,6 +1792,7 @@ function openModal(title, fields, data, onSave) {
     const cancelBtn = document.getElementById('modal-cancel');
 
     titleEl.textContent = title;
+    saveBtn.textContent = t('btn.save');
     saveBtn.style.display = '';
 
     body.innerHTML = fields.map(f => {
@@ -1880,6 +1991,136 @@ function openStockDialog(stock = null) {
                 await Api.createStock(formData);
             }
             await renderStock();
+        } catch { /* handled */ }
+    });
+}
+
+async function openDefectListDialog(stockId) {
+    const stock = State.stock.find(s => s.id === stockId);
+    if (!stock) return;
+    const mat = getSelectedMaterial();
+    const isPlatte = mat?.typ === 'Platte';
+
+    let pieces = [];
+    let defects = [];
+    try {
+        pieces = await Api.getPieces(stockId);
+        defects = await Api.getDefects(stockId);
+    } catch { return; }
+
+    const overlay = document.getElementById('modal-overlay');
+    const titleEl = document.getElementById('modal-title');
+    const body = document.getElementById('modal-body');
+    const saveBtn = document.getElementById('modal-save');
+    const cancelBtn = document.getElementById('modal-cancel');
+
+    titleEl.textContent = `${t('defect.title')} — ${formatDim(stock.laenge)}${isPlatte ? ' × ' + formatDim(stock.breite) : ''}`;
+    saveBtn.textContent = t('defect.new');
+    saveBtn.style.display = '';
+
+    const renderList = () => {
+        if (defects.length === 0) {
+            body.innerHTML = `<p class="empty-state">${t('defect.empty')}</p>`;
+        } else {
+            const widthCol = isPlatte ? `<th class="fd-table__cell">${t('defect.position_y')}</th>
+                <th class="fd-table__cell">${t('defect.width')}</th>` : '';
+            const rows = defects.map(d => {
+                const widthCells = isPlatte
+                    ? `<td class="fd-table__cell num">${formatDim(d.position_y)}</td>
+                       <td class="fd-table__cell num">${formatDim(d.breite)}</td>` : '';
+                return `<tr class="fd-table__row" data-defect-id="${d.id}">
+                    <td class="fd-table__cell num">#${d.stueck_nr}</td>
+                    <td class="fd-table__cell num">${formatDim(d.position)}</td>
+                    <td class="fd-table__cell num">${formatDim(d.laenge)}</td>
+                    ${widthCells}
+                    <td class="fd-table__cell">
+                        <button class="fd-button fd-button--compact defect-edit-btn" data-id="${d.id}">${t('btn.edit')}</button>
+                        <button class="fd-button fd-button--compact fd-button--negative defect-del-btn" data-id="${d.id}">${t('btn.delete')}</button>
+                    </td>
+                </tr>`;
+            }).join('');
+            body.innerHTML = `<table class="fd-table"><thead class="fd-table__header"><tr class="fd-table__row">
+                <th class="fd-table__cell">${t('piece.nr')}</th>
+                <th class="fd-table__cell">${t('defect.position')}</th>
+                <th class="fd-table__cell">${t('defect.length')}</th>
+                ${widthCol}
+                <th class="fd-table__cell"></th>
+            </tr></thead><tbody class="fd-table__body">${rows}</tbody></table>`;
+
+            body.querySelectorAll('.defect-edit-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const d = defects.find(x => x.id === parseInt(btn.dataset.id));
+                    if (d) {
+                        overlay.classList.remove('active');
+                        openDefectDialog(stockId, isPlatte, pieces, d, async () => {
+                            defects = await Api.getDefects(stockId);
+                            await renderStock();
+                            openDefectListDialog(stockId);
+                        });
+                    }
+                });
+            });
+            body.querySelectorAll('.defect-del-btn').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    try {
+                        await Api.deleteDefect(parseInt(btn.dataset.id));
+                        defects = await Api.getDefects(stockId);
+                        renderList();
+                        await renderStock();
+                    } catch { /* handled */ }
+                });
+            });
+        }
+    };
+
+    renderList();
+
+    saveBtn.onclick = () => {
+        overlay.classList.remove('active');
+        openDefectDialog(stockId, isPlatte, pieces, null, async () => {
+            defects = await Api.getDefects(stockId);
+            await renderStock();
+            openDefectListDialog(stockId);
+        });
+    };
+    cancelBtn.onclick = () => overlay.classList.remove('active');
+
+    overlay.classList.remove('hidden');
+    overlay.classList.add('active');
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.classList.remove('active'); };
+}
+
+function openDefectDialog(stockId, isPlatte, pieces, defect, onDone) {
+    const isEdit = !!defect;
+    const title = isEdit ? t('defect.edit') : t('defect.new');
+    const data = defect
+        ? { ...defect, _piece_id: defect.einzelstueck_id }
+        : { position: 0, position_y: 0, laenge: 0, breite: 0, _piece_id: pieces[0]?.id || 0 };
+
+    const pieceOptions = pieces.map(p => ({
+        value: String(p.id),
+        text: `#${p.nr}${p.notiz ? ' – ' + p.notiz : ''}`,
+    }));
+
+    const fields = [
+        { key: '_piece_id', label: t('piece.nr'), type: 'select', options: pieceOptions, required: true },
+        { key: 'position', label: t('defect.position'), type: 'number', required: true, isDimension: true, min: 0 },
+        { key: 'position_y', label: t('defect.position_y'), type: 'number', isDimension: true, hidden: !isPlatte, min: 0 },
+        { key: 'laenge', label: t('defect.length'), type: 'number', required: true, isDimension: true, min: 0.1 },
+        { key: 'breite', label: t('defect.width'), type: 'number', isDimension: true, hidden: !isPlatte, min: 0.1 },
+    ];
+
+    openModal(title, fields, data, async (formData) => {
+        if (!isPlatte) { formData.position_y = 0; formData.breite = 0; }
+        const pieceId = parseInt(formData._piece_id);
+        delete formData._piece_id;
+        try {
+            if (isEdit) {
+                await Api.updateDefect(defect.id, formData);
+            } else {
+                await Api.createDefect(pieceId, formData);
+            }
+            if (onDone) await onDone();
         } catch { /* handled */ }
     });
 }
@@ -2553,6 +2794,11 @@ function initEvents() {
                 await renderStock();
             } catch { /* handled */ }
         });
+    });
+
+    document.getElementById('btn-stock-defects')?.addEventListener('click', () => {
+        if (!State.selectedStockId) { showToast(t('defect.select_stock'), 'error'); return; }
+        openDefectListDialog(State.selectedStockId);
     });
 
     // ----- Project CRUD -----

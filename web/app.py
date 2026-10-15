@@ -20,6 +20,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.db import Database, seed_data
 from core.models import (
+    Defekt,
+    Einzelstueck,
     Lagerstueck,
     Maserung,
     Material,
@@ -137,6 +139,35 @@ class StockOut(BaseModel):
     stueckzahl: int
 
 
+class EinzelstueckOut(BaseModel):
+    id: int
+    lagerstueck_id: int
+    nr: int
+    notiz: str
+    defekt_count: int = 0
+
+
+class EinzelstueckIn(BaseModel):
+    notiz: str = ""
+
+
+class DefectIn(BaseModel):
+    position: float = 0.0
+    position_y: float = 0.0
+    laenge: float
+    breite: float = 0.0
+
+
+class DefectOut(BaseModel):
+    id: int
+    einzelstueck_id: int
+    stueck_nr: int = 0
+    position: float
+    position_y: float
+    laenge: float
+    breite: float
+
+
 class BladeIn(BaseModel):
     name: str
     schnittbreite: float = 3.0
@@ -204,10 +235,12 @@ class SchnittplanOut(BaseModel):
     lagerstueck_id: int
     lager_laenge: float
     lager_breite: float
+    stueck_nr: int = 0
     platzierungen: list[PlatzierungOut]
     reste: list[list[float]]
     verschnitt_mm: float
     verschnitt_prozent: float
+    defekte: list[DefectOut] = []
 
 
 class OptimizeResult(BaseModel):
@@ -341,13 +374,35 @@ def _projekt_to_out(p: Projekt) -> ProjectOut:
     )
 
 
-def _ergebnis_to_out(erg: OptimierungsErgebnis) -> OptimizeResult:
+def _ergebnis_to_out(
+    erg: OptimierungsErgebnis,
+    defekte_map: dict[int, dict[int, list]] | None = None,
+) -> OptimizeResult:
+    defekte_map = defekte_map or {}
+
+    def _defekte_for_plan(sp):
+        nr_map = defekte_map.get(sp.lagerstueck_id, {})
+        defs = nr_map.get(sp.stueck_nr, [])
+        return [
+            DefectOut(
+                id=d.id or 0,
+                einzelstueck_id=d.einzelstueck_id,
+                stueck_nr=sp.stueck_nr,
+                position=d.position,
+                position_y=d.position_y,
+                laenge=d.laenge,
+                breite=d.breite,
+            )
+            for d in defs
+        ]
+
     return OptimizeResult(
         schnittplaene=[
             SchnittplanOut(
                 lagerstueck_id=sp.lagerstueck_id,
                 lager_laenge=sp.lager_laenge,
                 lager_breite=sp.lager_breite,
+                stueck_nr=sp.stueck_nr,
                 platzierungen=[
                     PlatzierungOut(
                         teil_label=p.teil_label,
@@ -362,6 +417,7 @@ def _ergebnis_to_out(erg: OptimierungsErgebnis) -> OptimizeResult:
                 reste=[list(r) for r in sp.reste],
                 verschnitt_mm=sp.verschnitt_mm,
                 verschnitt_prozent=sp.verschnitt_prozent,
+                defekte=_defekte_for_plan(sp),
             )
             for sp in erg.schnittplaene
         ],
@@ -527,6 +583,110 @@ def delete_stock(sid: int):
     if not existing:
         raise HTTPException(404, "Stock piece not found")
     get_db().delete_lagerstueck(sid)
+
+
+# ---------------------------------------------------------------------------
+# Einzelstücke (individual pieces)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/stock/{sid}/pieces", response_model=list[EinzelstueckOut])
+def list_pieces(sid: int):
+    db = get_db()
+    pieces = db.list_einzelstuecke(sid)
+    result = []
+    for e in pieces:
+        cnt = len(db.list_defekte(e.id))
+        result.append(EinzelstueckOut(
+            id=e.id, lagerstueck_id=e.lagerstueck_id,
+            nr=e.nr, notiz=e.notiz, defekt_count=cnt))
+    return result
+
+
+@app.put("/api/pieces/{eid}", response_model=EinzelstueckOut)
+def update_piece(eid: int, data: EinzelstueckIn):
+    db = get_db()
+    e = db.get_einzelstueck(eid)
+    if not e:
+        raise HTTPException(404, "Piece not found")
+    e.notiz = data.notiz
+    e = db.save_einzelstueck(e)
+    cnt = len(db.list_defekte(e.id))
+    return EinzelstueckOut(
+        id=e.id, lagerstueck_id=e.lagerstueck_id,
+        nr=e.nr, notiz=e.notiz, defekt_count=cnt)
+
+
+# ---------------------------------------------------------------------------
+# Defects
+# ---------------------------------------------------------------------------
+
+
+def _defect_out(d: Defekt, stueck_nr: int = 0) -> DefectOut:
+    return DefectOut(
+        id=d.id, einzelstueck_id=d.einzelstueck_id,
+        stueck_nr=stueck_nr, position=d.position,
+        position_y=d.position_y, laenge=d.laenge, breite=d.breite)
+
+
+@app.get("/api/stock/{sid}/defects", response_model=list[DefectOut])
+def list_defects_for_stock(sid: int):
+    db = get_db()
+    defekte_by_nr = db.list_defekte_for_lagerstueck(sid)
+    result = []
+    for nr, defs in sorted(defekte_by_nr.items()):
+        for d in defs:
+            result.append(_defect_out(d, nr))
+    return result
+
+
+@app.get("/api/pieces/{eid}/defects", response_model=list[DefectOut])
+def list_defects(eid: int):
+    db = get_db()
+    e = db.get_einzelstueck(eid)
+    if not e:
+        raise HTTPException(404, "Piece not found")
+    return [_defect_out(d, e.nr) for d in db.list_defekte(eid)]
+
+
+@app.post("/api/pieces/{eid}/defects", response_model=DefectOut, status_code=201)
+def create_defect(eid: int, data: DefectIn):
+    db = get_db()
+    e = db.get_einzelstueck(eid)
+    if not e:
+        raise HTTPException(404, "Piece not found")
+    d = Defekt(
+        einzelstueck_id=eid,
+        position=data.position,
+        position_y=data.position_y,
+        laenge=data.laenge,
+        breite=data.breite,
+    )
+    d = db.save_defekt(d)
+    return _defect_out(d, e.nr)
+
+
+@app.put("/api/defects/{did}", response_model=DefectOut)
+def update_defect(did: int, data: DefectIn):
+    db = get_db()
+    existing = db.get_defekt(did)
+    if not existing:
+        raise HTTPException(404, "Defect not found")
+    existing.position = data.position
+    existing.position_y = data.position_y
+    existing.laenge = data.laenge
+    existing.breite = data.breite
+    existing = db.save_defekt(existing)
+    e = db.get_einzelstueck(existing.einzelstueck_id)
+    return _defect_out(existing, e.nr if e else 0)
+
+
+@app.delete("/api/defects/{did}", status_code=204)
+def delete_defect(did: int):
+    existing = get_db().get_defekt(did)
+    if not existing:
+        raise HTTPException(404, "Defect not found")
+    get_db().delete_defekt(did)
 
 
 # ---------------------------------------------------------------------------
@@ -696,8 +856,9 @@ def run_optimization(req: OptimizeRequest):
     kerf = blade.schnittbreite
     is_1d = material.typ == MaterialTyp.STANGE
 
+    defekte_map = get_db().list_defekte_for_material(req.material_id)
+
     if is_1d:
-        # Apply trim (Besaeumung): subtract 2*trim from bar length, drop too-short pieces
         besaeumung = material.besaeumung
         teil_tuples = [(t.label, t.laenge, t.offen_anzahl) for t in teile]
         stock = [
@@ -709,11 +870,10 @@ def run_optimization(req: OptimizeRequest):
             raise HTTPException(400, "No stock available for this material")
 
         if req.algorithm == "ga":
-            ergebnis = optimize_1d_ga(teil_tuples, stock, kerf)
+            ergebnis = optimize_1d_ga(teil_tuples, stock, kerf, defekte_map)
         else:
-            ergebnis = optimize_1d(teil_tuples, stock, kerf)
+            ergebnis = optimize_1d(teil_tuples, stock, kerf, defekte_map)
     else:
-        # Apply trim (Besaeumung) to stock dimensions
         besaeumung = material.besaeumung
         teil_tuples = [(t.label, t.laenge, t.breite, t.offen_anzahl) for t in teile]
         stock = [
@@ -726,7 +886,6 @@ def run_optimization(req: OptimizeRequest):
             for ls in vorrat
         ]
 
-        # Build per-part rotation rules from grain directions
         teil_drehung: dict[str, tuple[bool, bool]] = {}
         for t in teile:
             normal_ok, gedreht_ok = drehung_fuer_teil(material.maserung, t.maserung)
@@ -735,13 +894,16 @@ def run_optimization(req: OptimizeRequest):
         drehung_erlaubt = material.maserung == Maserung.KEINE
 
         if req.algorithm == "ga":
-            ergebnis = optimize_2d_ga(teil_tuples, stock, kerf, drehung_erlaubt, teil_drehung)
+            ergebnis = optimize_2d_ga(teil_tuples, stock, kerf, drehung_erlaubt,
+                                       teil_drehung, defekte_map)
         elif req.algorithm == "nested":
-            ergebnis = optimize_2d_nested(teil_tuples, stock, kerf, drehung_erlaubt, teil_drehung)
+            ergebnis = optimize_2d_nested(teil_tuples, stock, kerf, drehung_erlaubt,
+                                           teil_drehung, defekte_map)
         else:
-            ergebnis = optimize_2d(teil_tuples, stock, kerf, drehung_erlaubt, teil_drehung)
+            ergebnis = optimize_2d(teil_tuples, stock, kerf, drehung_erlaubt,
+                                    teil_drehung, defekte_map)
 
-    return _ergebnis_to_out(ergebnis)
+    return _ergebnis_to_out(ergebnis, defekte_map)
 
 
 # ---------------------------------------------------------------------------
@@ -1035,6 +1197,21 @@ WEB_EXTRA_TRANSLATIONS = {
     "proj.edit": {"de": "Projekt bearbeiten", "en": "Edit project", "fr": "Modifier le projet", "it": "Modifica progetto"},
     "proj.empty": {"de": "Keine Projekte.", "en": "No projects.", "fr": "Aucun projet.", "it": "Nessun progetto."},
     "error.pdf_failed": {"de": "PDF-Export fehlgeschlagen.", "en": "PDF export failed.", "fr": "Export PDF échoué.", "it": "Esportazione PDF fallita."},
+    "defect.title": {"de": "Defekte", "en": "Defects", "fr": "Défauts", "it": "Difetti"},
+    "defect.new": {"de": "Defekt hinzufügen", "en": "Add defect", "fr": "Ajouter un défaut", "it": "Aggiungi difetto"},
+    "defect.edit": {"de": "Defekt bearbeiten", "en": "Edit defect", "fr": "Modifier le défaut", "it": "Modifica difetto"},
+    "defect.position": {"de": "Position", "en": "Position", "fr": "Position", "it": "Posizione"},
+    "defect.position_y": {"de": "Position Y", "en": "Position Y", "fr": "Position Y", "it": "Posizione Y"},
+    "defect.length": {"de": "Länge", "en": "Length", "fr": "Longueur", "it": "Lunghezza"},
+    "defect.width": {"de": "Breite", "en": "Width", "fr": "Largeur", "it": "Larghezza"},
+    "defect.empty": {"de": "Keine Defekte.", "en": "No defects.", "fr": "Aucun défaut.", "it": "Nessun difetto."},
+    "defect.select_stock": {"de": "Bitte zuerst ein Lagerstück wählen.", "en": "Please select a stock piece first.", "fr": "Veuillez d'abord sélectionner une pièce.", "it": "Selezionare prima un pezzo."},
+    "defect.select_piece": {"de": "Bitte Stücknummer wählen.", "en": "Please select a piece number.", "fr": "Veuillez sélectionner un numéro de pièce.", "it": "Selezionare un numero di pezzo."},
+    "piece.title": {"de": "Einzelstücke", "en": "Individual pieces", "fr": "Pièces individuelles", "it": "Pezzi individuali"},
+    "piece.nr": {"de": "Stück #", "en": "Piece #", "fr": "Pièce n°", "it": "Pezzo n."},
+    "piece.note": {"de": "Notiz", "en": "Note", "fr": "Note", "it": "Nota"},
+    "piece.defects": {"de": "Defekte", "en": "Defects", "fr": "Défauts", "it": "Difetti"},
+    "dlg.delete_defect": {"de": "Defekt wirklich entfernen?", "en": "Really delete this defect?", "fr": "Vraiment supprimer ce défaut ?", "it": "Eliminare davvero questo difetto?"},
 }
 
 

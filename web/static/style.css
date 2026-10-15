@@ -677,3 +677,42 @@ kbd.hotkey-edit.capturing {
 
   .plan-header { flex-direction: column; align-items: flex-start; gap: 4px; }
 }
+
+.defect-badge {
+  display: inline-block;
+  background: var(--sapNegativeColor, #b00020);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 16px;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  border-radius: 8px;
+  padding: 0 4px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+
+td.expand-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+td.expand-toggle:hover { background: rgba(255,255,255,0.05); }
+.expand-arrow {
+  font-size: 10px;
+  opacity: 0.7;
+  display: inline-block;
+  width: 12px;
+}
+
+.piece-row .piece-cell {
+  font-size: 0.85em;
+  opacity: 0.8;
+  padding-left: 12px !important;
+}
+.piece-note {
+  color: var(--sapNeutralTextColor, #6a6d70);
+  font-style: italic;
+  margin-left: 4px;
+}

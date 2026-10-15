@@ -58,6 +58,7 @@ class Schnittplan:
     lagerstueck_id: int
     lager_laenge: float
     lager_breite: float = 0.0
+    stueck_nr: int = 0
     platzierungen: list[Platzierung] = field(default_factory=list)
     reste: list[tuple[float, float]] = field(default_factory=list)  # (L, W) or (L,)
     verschnitt_mm: float = 0.0       # 1D: mm, 2D: mm² (absolute waste)
@@ -87,6 +88,7 @@ def optimize_1d(
     teile: list[tuple[str, float, int]],
     vorrat: list[StangenVorrat],
     kerf: float = 3.0,
+    defekte: dict[int, dict[int, list]] | None = None,
 ) -> OptimierungsErgebnis:
     """1D bin packing with First-Fit-Decreasing.
 
@@ -105,34 +107,53 @@ def optimize_1d(
     einzelteile.sort(key=lambda t: t[1], reverse=True)
 
     verfuegbar: list[dict] = []
+    bar_idx = 0
     for sv in sorted(vorrat, key=lambda s: s.laenge):
-        for _ in range(sv.anzahl):
-            verfuegbar.append({
-                "id": sv.lagerstueck_id,
-                "laenge": sv.laenge,
-                "rest": sv.laenge,   # remaining usable length at the bar's end
-                "platzierungen": [],
-            })
+        defekte_map = defekte.get(sv.lagerstueck_id, {}) if defekte else {}
+        for copy_idx in range(sv.anzahl):
+            stueck_nr = copy_idx + 1
+            defs = sorted(defekte_map.get(stueck_nr, []),
+                           key=lambda d: d.position)
+            if defs:
+                segments = _split_bar_by_defects(sv.laenge, defs, kerf)
+                for seg_start, seg_len in segments:
+                    if seg_len > 0:
+                        verfuegbar.append({
+                            "id": sv.lagerstueck_id,
+                            "stueck_nr": stueck_nr,
+                            "laenge": seg_len,
+                            "rest": seg_len,
+                            "platzierungen": [],
+                            "_offset": seg_start,
+                            "_bar": bar_idx,
+                        })
+            else:
+                verfuegbar.append({
+                    "id": sv.lagerstueck_id,
+                    "stueck_nr": stueck_nr,
+                    "laenge": sv.laenge,
+                    "rest": sv.laenge,
+                    "platzierungen": [],
+                    "_offset": 0.0,
+                    "_bar": bar_idx,
+                })
+            bar_idx += 1
 
     fehlend: list[str] = []
 
     for label, teil_laenge in einzelteile:
         platziert = False
         for stange in verfuegbar:
-            # Kerf accounting: the first piece starts flush at the bar's
-            # end (no cut before it), every further piece needs one kerf
-            # of extra material for the cut separating it from the
-            # previous piece.
             benoetigte_breite = teil_laenge
             if stange["platzierungen"]:
                 benoetigte_breite += kerf
             if stange["rest"] >= benoetigte_breite:
-                # Next free position = consumed length so far (+ kerf gap)
                 pos = stange["laenge"] - stange["rest"]
                 if stange["platzierungen"]:
                     pos += kerf
                 stange["platzierungen"].append(
-                    Platzierung(teil_label=label, laenge=teil_laenge, x=pos)
+                    Platzierung(teil_label=label, laenge=teil_laenge,
+                                x=pos + stange["_offset"])
                 )
                 stange["rest"] -= benoetigte_breite
                 platziert = True
@@ -140,36 +161,7 @@ def optimize_1d(
         if not platziert:
             fehlend.append(label)
 
-    ergebnis = OptimierungsErgebnis(fehlende_teile=fehlend)
-    gesamt_nutzbar = 0.0
-    gesamt_genutzt = 0.0
-
-    for stange in verfuegbar:
-        if not stange["platzierungen"]:
-            continue
-        genutzt = sum(p.laenge for p in stange["platzierungen"])
-        # n pieces need n-1 separating cuts; the kerf material is lost
-        kerf_verlust = kerf * (len(stange["platzierungen"]) - 1)
-        verschnitt = stange["laenge"] - genutzt - kerf_verlust
-        plan = Schnittplan(
-            lagerstueck_id=stange["id"],
-            lager_laenge=stange["laenge"],
-            platzierungen=stange["platzierungen"],
-            reste=[(stange["rest"],)] if stange["rest"] > 0 else [],
-            verschnitt_mm=verschnitt,
-            verschnitt_prozent=round(verschnitt / stange["laenge"] * 100, 1)
-            if stange["laenge"] > 0 else 0,
-        )
-        ergebnis.schnittplaene.append(plan)
-        gesamt_nutzbar += stange["laenge"]
-        gesamt_genutzt += genutzt
-
-    if gesamt_nutzbar > 0:
-        ergebnis.gesamt_verschnitt_prozent = round(
-            (1 - gesamt_genutzt / gesamt_nutzbar) * 100, 1
-        )
-
-    return ergebnis
+    return _build_1d_result_segments(verfuegbar, fehlend, kerf)
 
 
 # =====================================================================
@@ -208,6 +200,7 @@ def optimize_2d(
     kerf: float = 3.0,
     drehung_erlaubt: bool = True,
     teil_drehung: dict[str, tuple[bool, bool]] | None = None,
+    defekte: dict[int, dict[int, list]] | None = None,
 ) -> OptimierungsErgebnis:
     """2D guillotine packing with Best-Area-Fit.
 
@@ -237,12 +230,20 @@ def optimize_2d(
 
     platten: list[dict] = []
     for pv in sorted(vorrat, key=lambda p: p.laenge * p.breite):
-        for _ in range(pv.anzahl):
+        defekte_map = defekte.get(pv.lagerstueck_id, {}) if defekte else {}
+        for copy_idx in range(pv.anzahl):
+            stueck_nr = copy_idx + 1
+            freiraeume = [_Freiraum(0, 0, pv.laenge, pv.breite)]
+            for d in defekte_map.get(stueck_nr, []):
+                freiraeume = _subtract_rect(
+                    freiraeume, d.position, d.position_y,
+                    d.laenge, d.breite, kerf)
             platten.append({
                 "id": pv.lagerstueck_id,
+                "stueck_nr": stueck_nr,
                 "laenge": pv.laenge,
                 "breite": pv.breite,
-                "freiraeume": [_Freiraum(0, 0, pv.laenge, pv.breite)],
+                "freiraeume": freiraeume,
                 "platzierungen": [],
             })
 
@@ -255,7 +256,6 @@ def optimize_2d(
         best_gedreht = False
         best_rest_flaeche = float("inf")
 
-        # Determine allowed orientations for this part (grain rules)
         if teil_drehung and label in teil_drehung:
             normal_ok, gedreht_ok = teil_drehung[label]
         else:
@@ -342,6 +342,7 @@ def optimize_2d(
             lagerstueck_id=platte["id"],
             lager_laenge=platte["laenge"],
             lager_breite=platte["breite"],
+            stueck_nr=platte.get("stueck_nr", 0),
             platzierungen=platte["platzierungen"],
             reste=reste,
             verschnitt_mm=verschnitt,
@@ -370,6 +371,7 @@ def optimize_2d_nested(
     kerf: float = 3.0,
     drehung_erlaubt: bool = True,
     teil_drehung: dict[str, tuple[bool, bool]] | None = None,
+    defekte: dict[int, dict[int, list]] | None = None,
 ) -> OptimierungsErgebnis:
     """2D nested guillotine: tries both split directions per cut.
 
@@ -385,7 +387,8 @@ def optimize_2d_nested(
     einzelteile.sort(key=lambda t: t[1] * t[2], reverse=True)
 
     if not einzelteile or not vorrat:
-        return optimize_2d(teile, vorrat, kerf, drehung_erlaubt, teil_drehung)
+        return optimize_2d(teile, vorrat, kerf, drehung_erlaubt, teil_drehung,
+                           defekte)
 
     def get_orient(label):
         if teil_drehung and label in teil_drehung:
@@ -394,11 +397,19 @@ def optimize_2d_nested(
 
     platten: list[dict] = []
     for pv in sorted(vorrat, key=lambda p: p.laenge * p.breite):
-        for _ in range(pv.anzahl):
+        defekte_map = defekte.get(pv.lagerstueck_id, {}) if defekte else {}
+        for copy_idx in range(pv.anzahl):
+            stueck_nr = copy_idx + 1
+            freiraeume = [_Freiraum(0, 0, pv.laenge, pv.breite)]
+            for d in defekte_map.get(stueck_nr, []):
+                freiraeume = _subtract_rect(
+                    freiraeume, d.position, d.position_y,
+                    d.laenge, d.breite, kerf)
             platten.append({
                 "id": pv.lagerstueck_id,
+                "stueck_nr": stueck_nr,
                 "laenge": pv.laenge, "breite": pv.breite,
-                "freiraeume": [_Freiraum(0, 0, pv.laenge, pv.breite)],
+                "freiraeume": freiraeume,
                 "platzierungen": [],
             })
 
@@ -509,6 +520,7 @@ def optimize_1d_ga(
     teile: list[tuple[str, float, int]],
     vorrat: list[StangenVorrat],
     kerf: float = 3.0,
+    defekte: dict[int, dict[int, list]] | None = None,
 ) -> OptimierungsErgebnis:
     """1D cutting stock with a genetic algorithm.
 
@@ -526,15 +538,30 @@ def optimize_1d_ga(
         einzelteile.extend((label, laenge) for _ in range(anzahl))
 
     if not einzelteile or not vorrat:
-        return optimize_1d(teile, vorrat, kerf)
+        return optimize_1d(teile, vorrat, kerf, defekte)
 
     n = len(einzelteile)
     rng = random.Random(42)
 
+    def _expand_bars():
+        bars = []
+        for sv in sorted(vorrat, key=lambda s: s.laenge):
+            defekte_map = defekte.get(sv.lagerstueck_id, {}) if defekte else {}
+            for copy_idx in range(sv.anzahl):
+                defs = sorted(defekte_map.get(copy_idx + 1, []),
+                               key=lambda d: d.position)
+                if defs:
+                    for _, seg_len in _split_bar_by_defects(sv.laenge, defs, kerf):
+                        if seg_len > 0:
+                            bars.append(seg_len)
+                else:
+                    bars.append(sv.laenge)
+        return bars
+
+    _bar_lengths = _expand_bars()
+
     def make_stangen():
-        return [{"laenge": sv.laenge, "rest": sv.laenge, "n": 0}
-                for sv in sorted(vorrat, key=lambda s: s.laenge)
-                for _ in range(sv.anzahl)]
+        return [{"laenge": bl, "rest": bl, "n": 0} for bl in _bar_lengths]
 
     def evaluate(perm: list[int]) -> float:
         stangen = make_stangen()
@@ -598,12 +625,30 @@ def optimize_1d_ga(
     best = max(population, key=evaluate)
 
     verfuegbar: list[dict] = []
+    bar_idx = 0
     for sv in sorted(vorrat, key=lambda s: s.laenge):
-        for _ in range(sv.anzahl):
-            verfuegbar.append({
-                "id": sv.lagerstueck_id, "laenge": sv.laenge,
-                "rest": sv.laenge, "platzierungen": [],
-            })
+        defekte_map = defekte.get(sv.lagerstueck_id, {}) if defekte else {}
+        for copy_idx in range(sv.anzahl):
+            stueck_nr = copy_idx + 1
+            defs = sorted(defekte_map.get(stueck_nr, []),
+                           key=lambda d: d.position)
+            if defs:
+                for seg_start, seg_len in _split_bar_by_defects(sv.laenge, defs, kerf):
+                    if seg_len > 0:
+                        verfuegbar.append({
+                            "id": sv.lagerstueck_id, "stueck_nr": stueck_nr,
+                            "laenge": seg_len,
+                            "rest": seg_len, "platzierungen": [],
+                            "_offset": seg_start, "_bar": bar_idx,
+                        })
+            else:
+                verfuegbar.append({
+                    "id": sv.lagerstueck_id, "stueck_nr": stueck_nr,
+                    "laenge": sv.laenge,
+                    "rest": sv.laenge, "platzierungen": [],
+                    "_offset": 0.0, "_bar": bar_idx,
+                })
+            bar_idx += 1
 
     fehlend: list[str] = []
     for idx in best:
@@ -616,14 +661,15 @@ def optimize_1d_ga(
                 if st["platzierungen"]:
                     pos += kerf
                 st["platzierungen"].append(
-                    Platzierung(teil_label=label, laenge=teil_laenge, x=pos))
+                    Platzierung(teil_label=label, laenge=teil_laenge,
+                                x=pos + st["_offset"]))
                 st["rest"] -= bed
                 placed = True
                 break
         if not placed:
             fehlend.append(label)
 
-    return _build_1d_result(verfuegbar, fehlend, kerf)
+    return _build_1d_result_segments(verfuegbar, fehlend, kerf)
 
 
 def optimize_2d_ga(
@@ -632,6 +678,7 @@ def optimize_2d_ga(
     kerf: float = 3.0,
     drehung_erlaubt: bool = True,
     teil_drehung: dict[str, tuple[bool, bool]] | None = None,
+    defekte: dict[int, dict[int, list]] | None = None,
 ) -> OptimierungsErgebnis:
     """2D guillotine packing with a genetic algorithm.
 
@@ -647,7 +694,8 @@ def optimize_2d_ga(
         einzelteile.extend((label, laenge, breite) for _ in range(anzahl))
 
     if not einzelteile or not vorrat:
-        return optimize_2d(teile, vorrat, kerf, drehung_erlaubt, teil_drehung)
+        return optimize_2d(teile, vorrat, kerf, drehung_erlaubt, teil_drehung,
+                           defekte)
 
     n = len(einzelteile)
     rng = random.Random(42)
@@ -657,11 +705,22 @@ def optimize_2d_ga(
             return teil_drehung[label]
         return True, drehung_erlaubt
 
+    def _init_freiraeume(pv, stueck_nr):
+        freiraeume = [_Freiraum(0, 0, pv.laenge, pv.breite)]
+        defekte_map = defekte.get(pv.lagerstueck_id, {}) if defekte else {}
+        for d in defekte_map.get(stueck_nr, []):
+            freiraeume = _subtract_rect(
+                freiraeume, d.position, d.position_y,
+                d.laenge, d.breite, kerf)
+        return freiraeume
+
     def make_plates():
-        return [{"laenge": pv.laenge, "breite": pv.breite,
-                 "freiraeume": [_Freiraum(0, 0, pv.laenge, pv.breite)]}
-                for pv in sorted(vorrat, key=lambda p: p.laenge * p.breite)
-                for _ in range(pv.anzahl)]
+        plates = []
+        for pv in sorted(vorrat, key=lambda p: p.laenge * p.breite):
+            for copy_idx in range(pv.anzahl):
+                plates.append({"laenge": pv.laenge, "breite": pv.breite,
+                               "freiraeume": _init_freiraeume(pv, copy_idx + 1)})
+        return plates
 
     def evaluate(perm, rots):
         plates = make_plates()
@@ -752,11 +811,13 @@ def optimize_2d_ga(
 
     platten: list[dict] = []
     for pv in sorted(vorrat, key=lambda p: p.laenge * p.breite):
-        for _ in range(pv.anzahl):
+        for copy_idx in range(pv.anzahl):
+            stueck_nr = copy_idx + 1
             platten.append({
                 "id": pv.lagerstueck_id,
+                "stueck_nr": stueck_nr,
                 "laenge": pv.laenge, "breite": pv.breite,
-                "freiraeume": [_Freiraum(0, 0, pv.laenge, pv.breite)],
+                "freiraeume": _init_freiraeume(pv, stueck_nr),
                 "platzierungen": [],
             })
 
@@ -798,7 +859,7 @@ def optimize_2d_ga(
     # both and return the better plan (fewer missing parts first, then
     # lower waste percentage).
     nested_result = optimize_2d_nested(
-        teile, vorrat, kerf, drehung_erlaubt, teil_drehung)
+        teile, vorrat, kerf, drehung_erlaubt, teil_drehung, defekte)
     return min(
         (ga_result, nested_result),
         key=lambda r: (len(r.fehlende_teile), r.gesamt_verschnitt_prozent),
@@ -808,6 +869,110 @@ def optimize_2d_ga(
 # =====================================================================
 # Shared result builders
 # =====================================================================
+
+def _subtract_rect(freiraeume: list[_Freiraum],
+                   dx: float, dy: float, dl: float, db: float,
+                   kerf: float) -> list[_Freiraum]:
+    """Remove a rectangular defect area from a list of free rectangles.
+
+    Each free rectangle that overlaps the defect is split into up to four
+    non-overlapping sub-rectangles (left, right, top, bottom strips).
+    """
+    result: list[_Freiraum] = []
+    for fr in freiraeume:
+        fx2 = fr.x + fr.laenge
+        fy2 = fr.y + fr.breite
+        dx2 = dx + dl
+        dy2 = dy + db
+
+        if dx >= fx2 or dx2 <= fr.x or dy >= fy2 or dy2 <= fr.y:
+            result.append(fr)
+            continue
+
+        # Left strip
+        left_w = max(0, dx - fr.x - kerf)
+        if left_w > 0:
+            result.append(_Freiraum(fr.x, fr.y, left_w, fr.breite))
+        # Right strip
+        right_start = dx2 + kerf
+        right_w = max(0, fx2 - right_start)
+        if right_w > 0:
+            result.append(_Freiraum(right_start, fr.y, right_w, fr.breite))
+        # Top strip (between left and right)
+        mid_x = max(fr.x, dx - kerf) if left_w <= 0 else dx - kerf
+        mid_x = max(fr.x, dx)
+        mid_x2 = min(fx2, dx2)
+        mid_w = mid_x2 - mid_x
+        top_h = max(0, dy - fr.y - kerf)
+        if mid_w > 0 and top_h > 0:
+            result.append(_Freiraum(mid_x, fr.y, mid_w, top_h))
+        # Bottom strip (between left and right)
+        bot_start = dy2 + kerf
+        bot_h = max(0, fy2 - bot_start)
+        if mid_w > 0 and bot_h > 0:
+            result.append(_Freiraum(mid_x, bot_start, mid_w, bot_h))
+
+    return result
+
+
+def _split_bar_by_defects(bar_length: float, defects: list,
+                          kerf: float) -> list[tuple[float, float]]:
+    """Split a bar into usable segments around defect zones.
+
+    Returns list of (start_offset, segment_length) pairs.
+    """
+    segments: list[tuple[float, float]] = []
+    cursor = 0.0
+    for d in sorted(defects, key=lambda d: d.position):
+        seg_len = d.position - cursor
+        if seg_len > kerf:
+            segments.append((cursor, seg_len))
+        cursor = d.position + d.laenge
+    if bar_length - cursor > kerf:
+        segments.append((cursor, bar_length - cursor))
+    return segments
+
+
+def _build_1d_result_segments(verfuegbar, fehlend, kerf):
+    """Build 1D result, merging segments of the same physical bar."""
+    by_bar: dict[int, list] = {}
+    for st in verfuegbar:
+        if not st["platzierungen"]:
+            continue
+        by_bar.setdefault(st["_bar"], []).append(st)
+
+    ergebnis = OptimierungsErgebnis(fehlende_teile=fehlend)
+    gesamt_nutzbar = gesamt_genutzt = 0.0
+
+    for _, segments in sorted(by_bar.items()):
+        all_platz: list = []
+        total_len = 0.0
+        total_rest = 0.0
+        lid = segments[0]["id"]
+        stueck_nr = segments[0].get("stueck_nr", 0)
+        for seg in segments:
+            all_platz.extend(seg["platzierungen"])
+            total_len += seg["laenge"]
+            total_rest += seg["rest"]
+
+        genutzt = sum(p.laenge for p in all_platz)
+        kv = kerf * max(0, len(all_platz) - 1)
+        verschnitt = total_len - genutzt - kv
+        ergebnis.schnittplaene.append(Schnittplan(
+            lagerstueck_id=lid, lager_laenge=total_len,
+            stueck_nr=stueck_nr, platzierungen=all_platz,
+            reste=[(total_rest,)] if total_rest > 0 else [],
+            verschnitt_mm=verschnitt,
+            verschnitt_prozent=round(verschnitt / total_len * 100, 1)
+            if total_len > 0 else 0))
+        gesamt_nutzbar += total_len
+        gesamt_genutzt += genutzt
+
+    if gesamt_nutzbar > 0:
+        ergebnis.gesamt_verschnitt_prozent = round(
+            (1 - gesamt_genutzt / gesamt_nutzbar) * 100, 1)
+    return ergebnis
+
 
 def _build_1d_result(verfuegbar, fehlend, kerf):
     ergebnis = OptimierungsErgebnis(fehlende_teile=fehlend)
@@ -820,6 +985,7 @@ def _build_1d_result(verfuegbar, fehlend, kerf):
         verschnitt = st["laenge"] - genutzt - kv
         ergebnis.schnittplaene.append(Schnittplan(
             lagerstueck_id=st["id"], lager_laenge=st["laenge"],
+            stueck_nr=st.get("stueck_nr", 0),
             platzierungen=st["platzierungen"],
             reste=[(st["rest"],)] if st["rest"] > 0 else [],
             verschnitt_mm=verschnitt,
@@ -895,7 +1061,8 @@ def _build_2d_result(platten, fehlend, kerf=3.0):
         reste = _merge_reste(pl["freiraeume"], kerf)
         ergebnis.schnittplaene.append(Schnittplan(
             lagerstueck_id=pl["id"], lager_laenge=pl["laenge"],
-            lager_breite=pl["breite"], platzierungen=pl["platzierungen"],
+            lager_breite=pl["breite"], stueck_nr=pl.get("stueck_nr", 0),
+            platzierungen=pl["platzierungen"],
             reste=reste, verschnitt_mm=fl - gen,
             verschnitt_prozent=round((fl - gen) / fl * 100, 1) if fl > 0 else 0))
         gesamt_flaeche += fl

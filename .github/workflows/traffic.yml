@@ -114,7 +114,7 @@ jobs:
           ISSUE_NUM=$(gh issue list --repo $REPO --state open --search "$ISSUE_TITLE" --json number,title --jq '.[] | select(.title == "Weekly Traffic Report") | .number' | head -1)
 
           if [ -z "$ISSUE_NUM" ]; then
-            ISSUE_NUM=$(gh issue create --repo $REPO --title "$ISSUE_TITLE" --body "Automated weekly traffic reports. A new comment is added every Monday." --label "automated" | grep -o '[0-9]*$')
+            ISSUE_NUM=$(gh issue create --repo $REPO --title "$ISSUE_TITLE" --body "Automated weekly traffic reports. A new comment is added every Monday." | grep -o '[0-9]*$')
           fi
 
           gh issue comment $ISSUE_NUM --repo $REPO --body-file /tmp/report.md

@@ -526,9 +526,12 @@ def optimize_1d_ga(
 
     Chromosome = permutation of the part order; placement itself is
     deterministic first-fit per permutation, so the GA only searches
-    the ordering. Fitness = total placed length. The FFD ordering is
-    seeded into the initial population, so the GA can never end up
-    worse than plain FFD.
+    the ordering. Fitness (see `evaluate`) ranks, in this order:
+    number of placed parts, placed length, as little opened bar length
+    as possible (fewer / shorter bars), and finally bundled offcuts
+    (few large remnants instead of many small ones). The FFD ordering
+    is seeded into the initial population and the final plan is
+    compared against plain FFD, so the GA never returns anything worse.
 
     Note: random.Random(42) makes runs reproducible – two runs on the
     same input always return the same plan.
@@ -543,39 +546,85 @@ def optimize_1d_ga(
     n = len(einzelteile)
     rng = random.Random(42)
 
-    def _expand_bars():
-        bars = []
+    def _expand_bars() -> list[dict]:
+        """All usable segments, bars sorted ascending by length.
+
+        A bar without defects is one segment; a bar with defects is
+        split into several segments that share the same `_bar` index
+        (= the same physical bar).
+        """
+        segs: list[dict] = []
+        bar_idx = 0
         for sv in sorted(vorrat, key=lambda s: s.laenge):
             defekte_map = defekte.get(sv.lagerstueck_id, {}) if defekte else {}
             for copy_idx in range(sv.anzahl):
-                defs = sorted(defekte_map.get(copy_idx + 1, []),
-                               key=lambda d: d.position)
+                stueck_nr = copy_idx + 1
+                defs = sorted(defekte_map.get(stueck_nr, []),
+                              key=lambda d: d.position)
                 if defs:
-                    for _, seg_len in _split_bar_by_defects(sv.laenge, defs, kerf):
-                        if seg_len > 0:
-                            bars.append(seg_len)
+                    parts = _split_bar_by_defects(sv.laenge, defs, kerf)
                 else:
-                    bars.append(sv.laenge)
-        return bars
+                    parts = [(0.0, sv.laenge)]
+                for seg_start, seg_len in parts:
+                    if seg_len > 0:
+                        segs.append({
+                            "id": sv.lagerstueck_id, "stueck_nr": stueck_nr,
+                            "laenge": seg_len, "_offset": seg_start,
+                            "_bar": bar_idx,
+                        })
+                bar_idx += 1
+        return segs
 
-    _bar_lengths = _expand_bars()
+    _segments = _expand_bars()
+    _seg_lengths = [s["laenge"] for s in _segments]
+    _seg_bar = [s["_bar"] for s in _segments]
+    # Usable length per physical bar (sum of its segments). This is the
+    # same base that _build_1d_result_segments reports waste against.
+    _bar_usable: dict[int, float] = {}
+    for s in _segments:
+        _bar_usable[s["_bar"]] = _bar_usable.get(s["_bar"], 0.0) + s["laenge"]
 
-    def make_stangen():
-        return [{"laenge": bl, "rest": bl, "n": 0} for bl in _bar_lengths]
+    def evaluate(perm: list[int]) -> tuple[int, float, float, float]:
+        """Fitness of one ordering (higher is better, compared as tuple).
 
-    def evaluate(perm: list[int]) -> float:
-        stangen = make_stangen()
-        genutzt = 0.0
+        Decodes the permutation with first-fit (first part on a segment
+        without kerf, every further part `length + kerf`) and returns:
+
+          1. placed part count     – an extra part always wins,
+          2. placed length         – among equal counts, longer parts
+                                     placed (fewer/shorter ones missing),
+          3. -opened bar length    – usable length of all physical bars
+                                     touched at least once (several
+                                     segments of one bar = one bar), so
+                                     fewer/shorter bars win and waste
+                                     drops,
+          4. sum of squared rests  – tie-breaker: on the opened bars,
+                                     bundle leftovers into few large
+                                     (reusable) remnants instead of
+                                     many small ones.
+
+        A tuple instead of a weighted sum guarantees the strict priority
+        without having to pick weights large enough for every input.
+        """
+        rest = list(_seg_lengths)
+        used = [False] * len(rest)
+        placed = 0
+        placed_len = 0.0
         for idx in perm:
-            _, teil_laenge = einzelteile[idx]
-            for st in stangen:
-                bed = teil_laenge + (kerf if st["n"] > 0 else 0)
-                if st["rest"] >= bed:
-                    st["rest"] -= bed
-                    st["n"] += 1
-                    genutzt += teil_laenge
+            teil_laenge = einzelteile[idx][1]
+            for si in range(len(rest)):
+                bed = teil_laenge + (kerf if used[si] else 0)
+                if rest[si] >= bed:
+                    rest[si] -= bed
+                    used[si] = True
+                    placed += 1
+                    placed_len += teil_laenge
                     break
-        return genutzt
+        opened = {_seg_bar[si] for si in range(len(rest)) if used[si]}
+        opened_len = sum(_bar_usable[b] for b in opened)
+        rest_sq = sum(r * r for si, r in enumerate(rest)
+                      if _seg_bar[si] in opened)
+        return placed, placed_len, -opened_len, rest_sq
 
     def crossover(p1: list[int], p2: list[int]) -> list[int]:
         # Order crossover (OX): copy a random slice from parent 1,
@@ -594,6 +643,10 @@ def optimize_1d_ga(
                 pos += 1
                 used.add(gene)
         return child
+
+    if n < 2:
+        # Nothing to permute (and rng.sample(range(1), 2) would fail).
+        return optimize_1d(teile, vorrat, kerf, defekte)
 
     # Seed the population with the plain FFD ordering (known-good baseline)
     ffd_order = sorted(range(n), key=lambda i: einzelteile[i][1], reverse=True)
@@ -624,31 +677,9 @@ def optimize_1d_ga(
 
     best = max(population, key=evaluate)
 
-    verfuegbar: list[dict] = []
-    bar_idx = 0
-    for sv in sorted(vorrat, key=lambda s: s.laenge):
-        defekte_map = defekte.get(sv.lagerstueck_id, {}) if defekte else {}
-        for copy_idx in range(sv.anzahl):
-            stueck_nr = copy_idx + 1
-            defs = sorted(defekte_map.get(stueck_nr, []),
-                           key=lambda d: d.position)
-            if defs:
-                for seg_start, seg_len in _split_bar_by_defects(sv.laenge, defs, kerf):
-                    if seg_len > 0:
-                        verfuegbar.append({
-                            "id": sv.lagerstueck_id, "stueck_nr": stueck_nr,
-                            "laenge": seg_len,
-                            "rest": seg_len, "platzierungen": [],
-                            "_offset": seg_start, "_bar": bar_idx,
-                        })
-            else:
-                verfuegbar.append({
-                    "id": sv.lagerstueck_id, "stueck_nr": stueck_nr,
-                    "laenge": sv.laenge,
-                    "rest": sv.laenge, "platzierungen": [],
-                    "_offset": 0.0, "_bar": bar_idx,
-                })
-            bar_idx += 1
+    verfuegbar: list[dict] = [
+        {**s, "rest": s["laenge"], "platzierungen": []} for s in _segments
+    ]
 
     fehlend: list[str] = []
     for idx in best:
@@ -669,7 +700,16 @@ def optimize_1d_ga(
         if not placed:
             fehlend.append(label)
 
-    return _build_1d_result_segments(verfuegbar, fehlend, kerf)
+    ga_result = _build_1d_result_segments(verfuegbar, fehlend, kerf)
+
+    # Safety net like in 2D: return the better of GA and plain FFD
+    # (fewer missing parts first, then lower waste percentage; GA wins
+    # ties).
+    ffd_result = optimize_1d(teile, vorrat, kerf, defekte)
+    return min(
+        (ga_result, ffd_result),
+        key=lambda r: (len(r.fehlende_teile), r.gesamt_verschnitt_prozent),
+    )
 
 
 def optimize_2d_ga(
